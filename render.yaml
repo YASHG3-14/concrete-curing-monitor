@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: concrete-curing-monitor
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # one worker: tables are created at startup, and the app is light enough for threads
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 60
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: API_KEY
+        generateValue: true          # copy this value from the Render dashboard into the ESP32 sketch
+      - key: DATABASE_URL
+        fromDatabase:
+          name: curing-db
+          property: connectionString
+      - key: REF_TEMP
+        value: "27"
+      - key: DATUM_TEMP
+        value: "0"
+
+databases:
+  - name: curing-db
+    plan: free
