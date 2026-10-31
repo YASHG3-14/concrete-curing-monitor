@@ -212,7 +212,62 @@ def status():
         pct_of_28d=(100.0 * s / s28) if (s is not None and s28) else None,
         datum=DATUM_TEMP,
         ref_temp=REF_TEMP,
+        alerts=alert_state(m),
     )
+
+
+def get_setting(key):
+    row = get_db().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    try:
+        return float(row["value"]) if row and row["value"] not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def alert_state(maturity):
+    ini, fin = get_setting("initial_setting_maturity"), get_setting("final_setting_maturity")
+    return {
+        "initial": ini,
+        "final": fin,
+        "initial_reached": ini is not None and maturity >= ini,
+        "final_reached": fin is not None and maturity >= fin,
+    }
+
+
+@app.get("/api/alerts")
+def alerts_get():
+    return jsonify(initial=get_setting("initial_setting_maturity"),
+                   final=get_setting("final_setting_maturity"))
+
+
+@app.post("/api/alerts")
+def alerts_set():
+    """Save the maturity (deg C-h) at which initial / final setting is considered complete.
+    An empty value clears that alert."""
+    d = request.get_json(silent=True) or {}
+    vals = {}
+    for key in ("initial", "final"):
+        v = d.get(key)
+        if v in (None, ""):
+            vals[key] = ""
+            continue
+        try:
+            vals[key] = float(v)
+        except (TypeError, ValueError):
+            return jsonify(error=f"{key} must be a number"), 400
+        if vals[key] <= 0:
+            return jsonify(error=f"{key} must be greater than 0"), 400
+    if vals["initial"] != "" and vals["final"] != "" and vals["initial"] >= vals["final"]:
+        return jsonify(error="Initial setting maturity must be less than final setting maturity"), 400
+    db = get_db()
+    for key, v in vals.items():
+        db.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (f"{key}_setting_maturity", str(v)),
+        )
+    db.commit()
+    return jsonify(ok=True)
 
 
 @app.post("/api/pour")
@@ -298,6 +353,15 @@ PAGE = """<!doctype html>
  .muted{color:#777;font-size:13px}
  .bar{height:10px;background:#e3e6ea;border-radius:5px;overflow:hidden;margin-top:6px}
  .bar i{display:block;height:100%;background:#2e8b57;width:0}
+ #banners{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+ .banner{padding:12px 16px;border-radius:8px;font-weight:600;display:flex;align-items:center;gap:10px}
+ .banner.ok{background:#d3f9d8;color:#1b5e20;border:1px solid #8fd19e}
+ .banner.final{background:#ffe8cc;color:#8a3b00;border:1px solid #ffc078}
+ .alertgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:8px 0}
+ .alertgrid label{display:block;font-size:14px}
+ .alertgrid input{width:100%;box-sizing:border-box;margin-top:4px}
+ .pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;background:#e3e6ea;color:#555}
+ .pill.done{background:#2e8b57;color:#fff}
 </style></head><body>
 <header>
  <h1>Concrete Curing Monitor</h1>
@@ -305,6 +369,7 @@ PAGE = """<!doctype html>
  <button onclick="markPour()">Mark pour = now</button>
 </header>
 <main>
+ <div id="banners"></div>
  <div class="cards">
   <div class="card"><small>Temperature</small><b id="temp">--</b> &deg;C<small id="last"></small></div>
   <div class="card"><small>Maturity (Nurse-Saul)</small><b id="mat">--</b> &deg;C&middot;h</div>
@@ -316,6 +381,23 @@ PAGE = """<!doctype html>
   <div class="panel"><h3>Live temperature</h3><canvas id="tchart" height="220"></canvas></div>
   <div class="panel"><h3>Strength&ndash;maturity calibration</h3><canvas id="cchart" height="220"></canvas>
    <div class="muted" id="fit"></div></div>
+ </div>
+ <div class="panel" style="margin-top:14px">
+  <h3>Maturity alerts</h3>
+  <form onsubmit="saveAlerts(event)">
+   <div class="alertgrid">
+    <label>1. Initial setting maturity (&deg;C&middot;h)
+     <input id="ainit" type="number" step="any" min="0" placeholder="e.g. 150"></label>
+    <label>2. Final setting maturity (&deg;C&middot;h)
+     <input id="afinal" type="number" step="any" min="0" placeholder="e.g. 400"></label>
+   </div>
+   <button>Save alerts</button>
+   <span id="alertmsg" class="muted"></span>
+  </form>
+  <p class="muted">When the slab's maturity passes a value, a banner appears at the top of the dashboard
+   ("Initial setting completed" / "Final setting completed"). Leave a box empty to turn that alert off.
+   Current maturity: <b id="curmat">--</b> &deg;C&middot;h &nbsp;
+   <span id="pill1" class="pill">Initial: not set</span> <span id="pill2" class="pill">Final: not set</span></p>
  </div>
  <div class="panel" style="margin-top:14px">
   <h3>Calibration data (cube tests)</h3>
@@ -375,6 +457,41 @@ async function refresh(){
   $('pctbar').style.width = st.calibrated ? Math.min(st.pct_of_28d,100)+'%' : '0';
   cchart.data.datasets[2].data = (st.calibrated && st.maturity > 0) ? [{x:st.maturity,y:st.strength}] : [];
   cchart.update();
+  renderAlerts(st);
+}
+
+const notified = {};
+function renderAlerts(st){
+  const a = st.alerts || {};
+  const box = $('banners'); box.innerHTML = '';
+  const add = (cls, text, key) => {
+    const d = document.createElement('div'); d.className = 'banner ' + cls; d.textContent = text; box.appendChild(d);
+    if (!notified[key]) { notified[key] = true;
+      try { if ('Notification' in window && Notification.permission === 'granted') new Notification(text); } catch(e){} }
+  };
+  if (a.initial_reached) add('ok', '✅ Initial setting completed (maturity ' + fmt(st.maturity,0) + ' ≥ ' + fmt(a.initial,0) + ' °C·h)', 'i');
+  if (a.final_reached) add('final', '🏁 Final setting completed (maturity ' + fmt(st.maturity,0) + ' ≥ ' + fmt(a.final,0) + ' °C·h)', 'f');
+  $('curmat').textContent = fmt(st.maturity, 0);
+  const pill = (el, name, thr, done) => { el.textContent = name + ': ' + (thr == null ? 'not set' : (done ? 'completed' : 'pending at ' + fmt(thr,0)));
+    el.className = 'pill' + (done ? ' done' : ''); };
+  pill($('pill1'), 'Initial', a.initial, a.initial_reached);
+  pill($('pill2'), 'Final', a.final, a.final_reached);
+}
+
+async function loadAlerts(){
+  const a = await j('/api/alerts');
+  $('ainit').value = a.initial ?? '';
+  $('afinal').value = a.final ?? '';
+}
+
+async function saveAlerts(e){
+  e.preventDefault();
+  try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch(x){}
+  const r = await j('/api/alerts',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({initial:$('ainit').value, final:$('afinal').value})});
+  if (r.error) return alert(r.error);
+  $('alertmsg').textContent = 'Saved'; setTimeout(() => $('alertmsg').textContent = '', 2500);
+  refresh();
 }
 
 async function loadCal(){
@@ -412,7 +529,7 @@ async function markPour(){
 }
 
 sensorSel.onchange = refresh;
-(async()=>{ await loadSensors(); await loadCal(); await refresh();
+(async()=>{ await loadSensors(); await loadCal(); await loadAlerts(); await refresh();
   setInterval(refresh, 5000); setInterval(loadSensors, 30000); })();
 </script></body></html>"""
 
